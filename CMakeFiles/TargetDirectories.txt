@@ -1,0 +1,3 @@
+/home/hemanth/CG/CS5024-Assignment-1/CMakeFiles/CS5024_Assignment_1.dir
+/home/hemanth/CG/CS5024-Assignment-1/CMakeFiles/edit_cache.dir
+/home/hemanth/CG/CS5024-Assignment-1/CMakeFiles/rebuild_cache.dir
