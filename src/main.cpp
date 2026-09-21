@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -15,15 +17,15 @@
 
 // ---------------------------------------------------------------------
 // WINDOW / GRID SIZE SETTINGS
-// Change GRID_LINES to 6 for a 5x5x5 grid, or 11 for a 10x10x10 grid.
+// GRID_LINES = 21 gives a 20x20x20 grid of cells.
 // GRID_MAX is CALCULATED from GRID_LINES so it can never go out of sync
 // with the number of lines actually drawn.
 // ---------------------------------------------------------------------
 constexpr int WINDOW_WIDTH = 1200;
 constexpr int WINDOW_HEIGHT = 900;
 
-constexpr int GRID_LINES = 5;
-constexpr float GRID_MIN = -2.0f;
+constexpr int GRID_LINES = 21;
+constexpr float GRID_MIN = -10.0f;
 constexpr float GRID_MAX = GRID_MIN + static_cast<float>(GRID_LINES - 1);
 constexpr int CELL_COUNT = GRID_LINES - 1;
 
@@ -52,6 +54,9 @@ const std::vector<std::string> HUD_LINES = {
     "F : FILL CELL",
     "W : CLEAR CELL",
     "L R T D : ROTATE",
+    "1 2 3 : SHAPES",
+    "0 : CLEAR ALL",
+    "H : HIDE GRID",
     "ESC : QUIT"
 };
 
@@ -77,11 +82,20 @@ GLsizei g_hudVertexCount = 0;
 glm::vec3 g_cubePosition(0.0f);
 glm::vec3 g_cubeColor(0.9f, 0.2f, 0.2f);
 glm::mat4 g_rotation(1.0f);
+bool      g_showGrid = true; // toggled with the H key
 
-// Bug fix (kept from before): each filled box remembers its OWN color,
-// instead of borrowing whatever color the cursor cube currently has.
+// Each filled box remembers its OWN color, instead of borrowing whatever
+// color the cursor cube currently has.
 bool      g_filled[CELL_COUNT][CELL_COUNT][CELL_COUNT] = {};
 glm::vec3 g_filledColor[CELL_COUNT][CELL_COUNT][CELL_COUNT] = {};
+
+// The rasterized shapes live in their own layer so toggling a shape never
+// touches cells you filled by hand with F.
+bool      g_modelFilled[CELL_COUNT][CELL_COUNT][CELL_COUNT] = {};
+glm::vec3 g_modelColor[CELL_COUNT][CELL_COUNT][CELL_COUNT] = {};
+bool g_showLine = false; // 1 toggles the line
+bool g_showRing = false; // 2 toggles the ring
+bool g_showBall = false; // 3 toggles the ball
 
 std::array<int, GLFW_KEY_LAST + 1> g_previousKeys = {};
 
@@ -223,7 +237,7 @@ GLuint makeMesh(const std::vector<float>& vertices)
 }
 
 // ---------------------------------------------------------------------
-// HUD TEXT HELPERS (new: on-screen controls legend)
+// HUD TEXT HELPERS (on-screen controls legend)
 // Each glyph is a 5-column x 7-row grid of dots. One row is stored as
 // a 5-bit number: bit 4 = leftmost column ... bit 0 = rightmost column.
 // Unknown characters are simply skipped (drawn blank).
@@ -256,6 +270,10 @@ const uint8_t* getGlyphRows(char c)
     static const uint8_t X[7] = {0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001};
     static const uint8_t Y[7] = {0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100};
     static const uint8_t Z[7] = {0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111};
+    static const uint8_t D0[7] = {0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110};
+    static const uint8_t D1[7] = {0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110};
+    static const uint8_t D2[7] = {0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111};
+    static const uint8_t D3[7] = {0b11110,0b00001,0b00001,0b01110,0b00001,0b00001,0b11110};
     static const uint8_t COLON[7] = {0b00000,0b00100,0b00000,0b00000,0b00000,0b00100,0b00000};
     static const uint8_t SLASH[7] = {0b00001,0b00010,0b00100,0b00100,0b01000,0b10000,0b00000};
     static const uint8_t SPACE[7] = {0,0,0,0,0,0,0};
@@ -270,6 +288,8 @@ const uint8_t* getGlyphRows(char c)
         case 'S': return S;  case 'T': return T;  case 'U': return U;
         case 'V': return V;  case 'W': return W;  case 'X': return X;
         case 'Y': return Y;  case 'Z': return Z;
+        case '0': return D0;  case '1': return D1;
+        case '2': return D2;  case '3': return D3;
         case ':': return COLON;
         case '/': return SLASH;
         case ' ': return SPACE;
@@ -342,6 +362,123 @@ std::vector<float> buildHudVertices()
 }
 
 // ---------------------------------------------------------------------
+// RASTERIZED MODEL: "Ringed Planet"
+// Every shape is rasterized by deciding which grid cells to fill.
+//   - Ball   : sphere shell, distance test per cell
+//   - Circle : midpoint circle algorithm (ring around the ball)
+//   - Line   : 3D Bresenham (slanted axis through the planet)
+// ---------------------------------------------------------------------
+
+// Fills one cell with a color (ignores cells outside the grid).
+void setVoxel(int x, int y, int z, const glm::vec3& c)
+{
+    if (x < 0 || y < 0 || z < 0 ||
+        x >= CELL_COUNT || y >= CELL_COUNT || z >= CELL_COUNT)
+        return;
+    g_modelFilled[x][y][z] = true;
+    g_modelColor[x][y][z] = c;
+}
+
+// Hue t (any float, wraps around 0..1) -> rainbow RGB.
+glm::vec3 rainbow(float t)
+{
+    t -= std::floor(t);
+    return glm::clamp(glm::vec3(std::abs(t * 6.0f - 3.0f) - 1.0f,
+                                2.0f - std::abs(t * 6.0f - 2.0f),
+                                2.0f - std::abs(t * 6.0f - 4.0f)),
+                      0.0f, 1.0f);
+}
+
+// 3D Bresenham line. The hue fades from h0 to h1 along the line.
+void drawLine3D(glm::ivec3 a, glm::ivec3 b, float h0, float h1)
+{
+    const int dx = std::abs(b.x - a.x);
+    const int dy = std::abs(b.y - a.y);
+    const int dz = std::abs(b.z - a.z);
+    const int sx = a.x < b.x ? 1 : -1;
+    const int sy = a.y < b.y ? 1 : -1;
+    const int sz = a.z < b.z ? 1 : -1;
+    const int dm = std::max({dx, dy, dz}); // dominant axis length
+
+    int ex = dm / 2, ey = dm / 2, ez = dm / 2;
+    int x = a.x, y = a.y, z = a.z;
+    for (int i = 0; i <= dm; ++i)
+    {
+        const float t = dm ? static_cast<float>(i) / static_cast<float>(dm) : 0.0f;
+        setVoxel(x, y, z, rainbow(h0 + (h1 - h0) * t));
+        ex -= dx; if (ex < 0) { ex += dm; x += sx; }
+        ey -= dy; if (ey < 0) { ey += dm; y += sy; }
+        ez -= dz; if (ez < 0) { ez += dm; z += sz; }
+    }
+}
+
+// Midpoint circle in the XZ plane at height cy. Hue follows the angle.
+void drawCircle(int cx, int cy, int cz, int r)
+{
+    auto plot = [&](int dx, int dz) {
+        const float hue = std::atan2(static_cast<float>(dz), static_cast<float>(dx))
+                              / 6.2831853f + 0.5f;
+        setVoxel(cx + dx, cy, cz + dz, rainbow(hue));
+    };
+
+    int x = r, z = 0, err = 1 - r;
+    while (x >= z)
+    {
+        plot( x,  z); plot( z,  x); plot(-z,  x); plot(-x,  z);
+        plot(-x, -z); plot(-z, -x); plot( z, -x); plot( x, -z);
+        ++z;
+        if (err < 0)
+            err += 2 * z + 1;
+        else
+        {
+            --x;
+            err += 2 * (z - x) + 1;
+        }
+    }
+}
+
+// Hollow sphere (1-cell shell). Hue follows height.
+void drawSphere(int cx, int cy, int cz, int r)
+{
+    for (int dx = -r; dx <= r; ++dx)
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dz = -r; dz <= r; ++dz)
+            {
+                const float d = std::sqrt(static_cast<float>(dx * dx + dy * dy + dz * dz));
+                if (d > static_cast<float>(r) - 0.5f && d <= static_cast<float>(r) + 0.5f)
+                    setVoxel(cx + dx, cy + dy, cz + dz,
+                             rainbow(static_cast<float>(dy + r) / (2.0f * static_cast<float>(r))));
+            }
+}
+
+// Redraws the model layer from the show/hide flags of each shape.
+void rebuildModel()
+{
+    for (int x = 0; x < CELL_COUNT; ++x)
+        for (int y = 0; y < CELL_COUNT; ++y)
+            for (int z = 0; z < CELL_COUNT; ++z)
+                g_modelFilled[x][y][z] = false;
+
+    if (g_showBall)
+        drawSphere(10, 10, 10, 4);                        // ball
+    if (g_showRing)
+        drawCircle(10, 10, 10, 8);                        // ring
+    if (g_showLine)
+        drawLine3D({3, 1, 3}, {17, 19, 17}, 0.0f, 1.0f);  // axis
+}
+
+// Blank canvas: hides every shape and removes hand-filled cells too.
+void clearAll()
+{
+    g_showLine = g_showRing = g_showBall = false;
+    for (int x = 0; x < CELL_COUNT; ++x)
+        for (int y = 0; y < CELL_COUNT; ++y)
+            for (int z = 0; z < CELL_COUNT; ++z)
+                g_filled[x][y][z] = false;
+    rebuildModel();
+}
+
+// ---------------------------------------------------------------------
 // SHADER / WINDOW SETUP HELPERS
 // ---------------------------------------------------------------------
 
@@ -392,7 +529,7 @@ bool initWindow()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
     g_window = glfwCreateWindow(
-        WINDOW_WIDTH, WINDOW_HEIGHT, "CS5064 Assignment 1 - 3D Cubic Grid", nullptr, nullptr);
+        WINDOW_WIDTH, WINDOW_HEIGHT, "CS5024 Assignment 1 - 3D Cubic Grid", nullptr, nullptr);
     if (!g_window)
     {
         std::cerr << "Failed to create GLFW window.\n";
@@ -442,6 +579,8 @@ bool setupScene()
     g_useOverrideLoc = glGetUniformLocation(g_shaderProgram, "useOverrideColor");
 
     g_cubePosition = glm::vec3(cellCenter(1), cellCenter(1), cellCenter(1));
+
+    rebuildModel(); // starts blank; press 1/2/3 to show shapes
     return true;
 }
 
@@ -494,10 +633,30 @@ void clearCurrentCell()
     const int y = positionToCell(g_cubePosition.y);
     const int z = positionToCell(g_cubePosition.z);
     g_filled[x][y][z] = false;
+    g_modelFilled[x][y][z] = false;
 }
 
 void handleFillKeys()
 {
+    if (keyPressedOnce(GLFW_KEY_H))
+        g_showGrid = !g_showGrid;
+    if (keyPressedOnce(GLFW_KEY_0))
+        clearAll();
+    if (keyPressedOnce(GLFW_KEY_1))
+    {
+        g_showLine = !g_showLine;
+        rebuildModel();
+    }
+    if (keyPressedOnce(GLFW_KEY_2))
+    {
+        g_showRing = !g_showRing;
+        rebuildModel();
+    }
+    if (keyPressedOnce(GLFW_KEY_3))
+    {
+        g_showBall = !g_showBall;
+        rebuildModel();
+    }
     if (keyPressedOnce(GLFW_KEY_F))
         fillCurrentCell();
     if (keyPressedOnce(GLFW_KEY_W))
@@ -536,7 +695,7 @@ void processInput()
 void useSceneCamera()
 {
     const glm::mat4 view = glm::translate(glm::mat4(1.0f),
-                                          glm::vec3(0.0f, 0.0f, -8.0f));
+                                          glm::vec3(0.0f, 0.0f, -35.0f));
     const glm::mat4 projection = glm::perspective(
         glm::radians(45.0f),
         static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT),
@@ -574,10 +733,12 @@ void drawFilledCubes()
         for (int y = 0; y < CELL_COUNT; ++y)
             for (int z = 0; z < CELL_COUNT; ++z)
             {
-                if (!g_filled[x][y][z])
+                const bool manual = g_filled[x][y][z];
+                if (!manual && !g_modelFilled[x][y][z])
                     continue;
 
-                const glm::vec3& boxColor = g_filledColor[x][y][z];
+                const glm::vec3& boxColor =
+                    manual ? g_filledColor[x][y][z] : g_modelColor[x][y][z];
                 glUniform3f(g_overrideColorLoc, boxColor.r, boxColor.g, boxColor.b);
 
                 const glm::mat4 cellModel =
@@ -612,18 +773,14 @@ void drawHud()
     glUniform1i(g_useOverrideLoc, GL_FALSE); // use each vertex's own baked-in color
     glBindVertexArray(g_hudVAO);
 
-    // Draw the background panel first, blended with whatever is already on
-    // screen (the grid) so it becomes see-through instead of fully covering
-    // it. glBlendColor's alpha is the "how see-through" knob; the shader's
-    // own output is not touched at all.
+    // Background panel, blended so the grid shows through it.
     glEnable(GL_BLEND);
     glBlendColor(0.0f, 0.0f, 0.0f, HUD_PANEL_ALPHA);
     glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, HUD_PANEL_VERTEX_COUNT);
     glDisable(GL_BLEND);
 
-    // Draw the legend text fully solid (no blending) so it stays crisp
-    // and easy to read on top of the see-through panel.
+    // Legend text fully solid so it stays crisp.
     glDrawArrays(GL_TRIANGLES, HUD_PANEL_VERTEX_COUNT,
                  g_hudVertexCount - HUD_PANEL_VERTEX_COUNT);
 
@@ -637,7 +794,8 @@ void renderFrame()
     glUseProgram(g_shaderProgram);
 
     useSceneCamera();
-    drawGridLines();
+    if (g_showGrid)
+        drawGridLines();
     drawFilledCubes();
     drawActiveCube();
 
@@ -675,6 +833,9 @@ int main()
 
     while (!glfwWindowShouldClose(g_window))
     {
+        if (glfwGetKey(g_window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(g_window, GLFW_TRUE);
+
         processInput();
         renderFrame();
     }
